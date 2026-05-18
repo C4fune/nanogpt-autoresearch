@@ -37,9 +37,12 @@ def _read_json(path: Path, default: Any) -> Any:
 class Best:
     train_time_ms: int | None = None
     val_loss: float | None = None
+    val_loss_std: float | None = None
     run_id: str | None = None
-    patch_branch: str | None = None
+    patch_branch: str | None = None       # "wins/<id>" if pinned
+    baseline_commit_sha: str | None = None  # ref new worktrees branch from
     n_seeds_confirmed: int = 0
+    n_wins_chain: int = 0                 # how many cumulative wins so far
     confirmed_at: str | None = None
     notes: str = ""
 

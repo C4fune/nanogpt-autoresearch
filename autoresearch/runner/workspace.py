@@ -21,14 +21,19 @@ class Worktree:
     branch: str
 
 
-def create(config: Config, run_id: str) -> Worktree:
+def create(config: Config, run_id: str, *, from_ref: str = "HEAD") -> Worktree:
+    """Create a per-attempt worktree branched from `from_ref`.
+
+    `from_ref` defaults to HEAD but the daemon passes `state.best.baseline_commit_sha`
+    so that subsequent attempts build on top of the cumulative wins chain.
+    """
     path = config.paths.worktree_for(run_id)
     branch = f"autoresearch/{run_id}"
     if path.exists():
         remove(config, run_id)
 
     proc = subprocess.run(
-        ["git", "worktree", "add", "-B", branch, str(path), "HEAD"],
+        ["git", "worktree", "add", "-B", branch, str(path), from_ref],
         cwd=config.repo_root,
         check=False,
         capture_output=True,
@@ -37,6 +42,25 @@ def create(config: Config, run_id: str) -> Worktree:
     if proc.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
     return Worktree(run_id=run_id, path=path, branch=branch)
+
+
+def current_baseline_sha(config: Config) -> str:
+    """SHA of the current parent for new attempts. Reads state.best.baseline_commit_sha
+    if present, else falls back to HEAD of the main repo.
+    """
+    from autoresearch.state import load_best
+
+    best = load_best(config.paths.best_json)
+    if best.baseline_commit_sha:
+        return best.baseline_commit_sha
+    proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=config.repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip()
 
 
 def remove(config: Config, run_id: str) -> None:

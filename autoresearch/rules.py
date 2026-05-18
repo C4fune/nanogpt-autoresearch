@@ -14,7 +14,6 @@ from pathlib import Path
 BANNED_INTRODUCED_SUBSTRINGS: tuple[str, ...] = (
     "torch._inductor.config",
     "coordinate_descent_tuning",
-    "dynamic=False",  # don't let it switch to dynamic compile or vice versa subtly
 )
 
 # Anchors that mark protected regions in train_gpt.py.

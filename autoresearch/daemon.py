@@ -1,19 +1,24 @@
 """Long-running loop. Built to run unattended for days.
 
-Lifecycle of a single iteration:
-  1. Recover from any crash recorded in cursor.json.
-  2. Refill backlog if low (calls planner LLM).
+Each iteration:
+  1. Recover any in-flight crash from cursor.json.
+  2. Refill backlog when low (planner LLM).
   3. Pop highest-priority idea.
-  4. Create worktree, snapshot files, apply patch.
-  5. Pre-checks (py_compile + import smoke); skip the GPU on failure.
-  6. Run training; capture metrics + gzip log.
-  7. Distill summary; emit verdict.
-  8. If win: schedule replication; advance baseline only after passing the test.
-  9. Periodically compact lessons; prune old logs.
- 10. Update budget; stop cleanly if exhausted.
+  4. Create worktree FROM state.best.baseline_commit_sha (so wins compound).
+  5. Apply patch (rule-gated). Snapshot the patched files into the run dir
+     (used later if this attempt becomes a confirmed win).
+  6. Pre-checks (py_compile + AST parse).
+  7. Run training; capture metrics + gzip log.
+  8. Distill 150-word summary.
+  9. If candidate win and not itself a replication: register batch, schedule
+     N replications. If this run was a replication: attach to batch.
+ 10. Evaluate any batches that have collected enough replications. Wins are
+     minted into .autoresearch/wins/<id>/, committed on a wins/<id> branch
+     (built on the parent baseline SHA), and best.json is advanced.
+ 11. Periodically compact lessons; prune old logs.
 
-Every step is a no-op-on-restart so the daemon can be SIGKILLed and resumed
-without losing more than the in-flight attempt.
+Everything is restart-safe: cursor.json + journal.jsonl + atomic state writes
+mean a SIGKILL loses at most the in-flight attempt.
 """
 
 from __future__ import annotations
@@ -25,29 +30,25 @@ import sys
 import time
 import traceback
 import uuid
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from autoresearch import backlog, journal
+from autoresearch import backlog, journal, winners
 from autoresearch.agent import compactor, distiller, planner
 from autoresearch.agent.llm import DryRunClient, LLMClient, default_client
 from autoresearch.agent.mutator import MutatorError, PatchPlan, apply_plan, parse_plan_json
-from autoresearch.agent.replication import evaluate as replication_evaluate
+from autoresearch.calibration import assert_calibrated
 from autoresearch.config import Config
 from autoresearch.parser.log_parser import LogMetrics, compact_log_summary
 from autoresearch.prechecks import run_all as run_prechecks
 from autoresearch.rules import classify_patch
 from autoresearch.runner import experiment, workspace
 from autoresearch.state import (
-    Best,
-    Budget,
     Cursor,
     clear_cursor,
     load_best,
     load_budget,
     load_cursor,
-    save_best,
     save_budget,
     save_cursor,
 )
@@ -63,6 +64,11 @@ def run_daemon(
 ) -> None:
     paths = config.paths
     paths.ensure()
+
+    if not dry_run:
+        # Refuse to start on uncalibrated hardware (or |deviation|>25%).
+        assert_calibrated(config)
+
     llm: LLMClient = DryRunClient() if dry_run else default_client()
 
     _install_signal_handlers()
@@ -92,6 +98,16 @@ def run_daemon(
             continue
 
         _execute_iteration(config, llm, idea, dry_run=dry_run)
+
+        # Aggregate any batches whose replications are now complete.
+        try:
+            advanced = winners.evaluate_batches(config, config.repo_root)
+            if advanced:
+                journal.emit(paths.journal_jsonl, "batches_advanced", batch_ids=advanced)
+        except Exception as e:
+            log.exception("winners.evaluate_batches failed")
+            journal.emit(paths.journal_jsonl, "winners_error", error=str(e))
+
         iteration += 1
 
         budget = load_budget(paths.budget_json)
@@ -120,20 +136,30 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
     plan = _idea_to_plan(idea)
     (run_dir / "idea.json").write_text(json.dumps(idea, default=str, indent=2))
 
+    # Each new attempt branches from the cumulative-best baseline SHA, not HEAD.
+    parent_sha = workspace.current_baseline_sha(config)
+    (run_dir / "parent_baseline_sha.txt").write_text(parent_sha + "\n")
+
     wt = None
-    snapshots: dict[str, str] = {}
     patch_preview = ""
     metrics: LogMetrics | None = None
+    metrics_dict: dict | None = None
     stderr_tail = ""
     verdict = "loss"
     error: str | None = None
     duration_s = 0.0
 
     try:
-        wt = workspace.create(config, run_id)
-        snapshots = workspace.snapshot_editable_files(wt, config)
+        wt = workspace.create(config, run_id, from_ref=parent_sha)
         patch_preview = apply_plan(plan, wt.path, config)
         (run_dir / "patch.diff").write_text(patch_preview)
+
+        # Snapshot patched files NOW so we can use them later if this run
+        # becomes a confirmed win (worktree is removed at end of iteration).
+        for rel in config.editable_files:
+            src = wt.path / rel
+            if src.exists():
+                (run_dir / f"{rel}.patched").write_text(src.read_text())
 
         save_cursor(paths.cursor_json, Cursor(run_id=run_id, started_at=_utc_now(), phase="prechecks"))
         pre = run_prechecks(wt.path, config.editable_files)
@@ -159,15 +185,12 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
                 else:
                     metrics = result.metrics
                     metrics_dict = _metrics_dict(metrics)
-                    # Surface the README's discretionary trade-offs so the planner sees them
-                    # in next round's hot context (via summary.md → recent summaries).
                     added, removed = plan.diff_size()
                     metrics_dict["diff_lines_added"] = added
                     metrics_dict["diff_lines_removed"] = removed
-                    best = load_best(paths.best_json)
-                    baseline_loss = best.val_loss or config.targets.baseline_val_loss
+                    best_now = load_best(paths.best_json)
+                    baseline_loss = best_now.val_loss or config.targets.baseline_val_loss
                     if metrics.final and baseline_loss is not None:
-                        # Negative = used buffer (val_loss got worse); positive = freed buffer.
                         metrics_dict["loss_buffer_delta"] = round(
                             baseline_loss - metrics.final.val_loss, 5
                         )
@@ -190,7 +213,7 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
                 workspace.remove(config, run_id)
             except Exception:
                 pass
-        # Distill (LLM call) — even crashes get a summary so future planners see them.
+
         try:
             distiller.distill_run(
                 config=config,
@@ -200,7 +223,7 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
                 category=idea.get("category", "mixed"),
                 rationale=idea.get("rationale", ""),
                 verdict=verdict,
-                metrics=_metrics_dict(metrics) if metrics else None,
+                metrics=metrics_dict,
                 patch_preview=patch_preview,
                 stderr_tail=stderr_tail,
             )
@@ -209,16 +232,64 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
                 f"verdict={verdict}\nerror={error or ''}\nfallback (distiller failed: {e})\n"
             )
 
-        # Update budget on real runs only.
+        # Tick budget counter (informational only).
         budget = load_budget(paths.budget_json)
         budget.runs_completed += 1
-        if not dry_run and verdict != "patch_rejected" and verdict != "precheck_failed":
+        if not dry_run and verdict not in ("patch_rejected", "precheck_failed"):
             budget.gpu_hours_used += duration_s / 3600.0
         save_budget(paths.budget_json, budget)
 
-        # Win? -> schedule replication or advance.
-        if verdict == "win" and metrics is not None:
-            _handle_win(config, idea, plan, metrics, patch_preview)
+        # Wire into the winners pipeline.
+        is_replication = "replication_of_run_id" in (idea.get("metadata") or {})
+        if is_replication:
+            batch_id = winners.find_batch_for_replication(
+                config,
+                replication_of=idea["metadata"]["replication_of_run_id"],
+            )
+            if batch_id:
+                winners.attach_replication(
+                    config,
+                    batch_id=batch_id,
+                    run_id=run_id,
+                    metrics=metrics_dict,
+                    success=(verdict in ("win", "loss") and metrics_dict is not None
+                             and metrics_dict.get("val_loss") is not None
+                             and metrics_dict.get("val_loss") <= config.targets.val_loss_max),
+                )
+        elif verdict == "win" and metrics_dict is not None:
+            klass = classify_patch([e.to_dict() for e in plan.edits], config.repo_root)
+            batch_id = winners.register_candidate(
+                config,
+                candidate_run_id=run_id,
+                candidate_metrics=metrics_dict,
+                classification=klass,
+                hypothesis=idea.get("hypothesis", ""),
+                category=idea.get("category", "mixed"),
+                rationale=idea.get("rationale", ""),
+                patch_diff=patch_preview,
+                parent_baseline_sha=parent_sha,
+            )
+            if klass != "systems":
+                # Schedule N replication runs that re-use the same edits.
+                for i in range(config.targets.replication_n):
+                    rep_idea = {
+                        "id": f"replicate_{run_id}_{i}",
+                        "hypothesis": f"REPLICATE seed#{i}: {idea.get('hypothesis', '')}",
+                        "category": idea.get("category", "mixed"),
+                        "rationale": "Replication for statistical confirmation per README rule 2.",
+                        "priority": 0.99 - i * 0.01,
+                        "tags": ["replication"] + list(idea.get("tags", [])),
+                        "edits": idea.get("edits", []),
+                        "metadata": {
+                            "replication_of_run_id": run_id,
+                            "replication_of_batch": batch_id,
+                            "seed": i,
+                        },
+                    }
+                    backlog.append(paths.backlog_jsonl, rep_idea)
+                journal.emit(paths.journal_jsonl, "replication_scheduled",
+                             of_run_id=run_id, batch_id=batch_id,
+                             n=config.targets.replication_n)
 
         clear_cursor(paths.cursor_json)
         journal.emit(
@@ -230,6 +301,7 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
             train_time_ms=metrics.final.train_time_ms if metrics and metrics.final else None,
             val_loss=metrics.final.val_loss if metrics and metrics.final else None,
             duration_s=duration_s,
+            is_replication=is_replication,
         )
 
 
@@ -258,69 +330,6 @@ def _verdict_from_metrics(metrics: LogMetrics, config: Config) -> str:
     if f.train_time_ms < baseline_ms:
         return "win"
     return "loss"
-
-
-def _handle_win(
-    config: Config,
-    idea: dict,
-    plan: PatchPlan,
-    metrics: LogMetrics,
-    patch_preview: str,
-) -> None:
-    paths = config.paths
-    klass = classify_patch([e.to_dict() for e in plan.edits], config.repo_root)
-    journal.emit(paths.journal_jsonl, "candidate_win",
-                 classification=klass,
-                 train_time_ms=metrics.final.train_time_ms,
-                 val_loss=metrics.final.val_loss)
-
-    if klass == "systems":
-        # README: pure systems changes waive p-value. One valid run wins.
-        _advance_baseline(config, plan, metrics, n=1, mean_loss=metrics.final.val_loss)
-        return
-
-    # ML change: schedule N replication runs of the SAME patch by appending high-priority
-    # ideas to the backlog. They'll be executed before any new exploration.
-    for i in range(config.targets.replication_n):
-        rep = {
-            "id": f"replicate_{idea.get('id')}_{i}",
-            "hypothesis": f"REPLICATE seed#{i}: {idea.get('hypothesis')}",
-            "category": idea.get("category", "mixed"),
-            "rationale": "Replication for statistical confirmation per README rule 2.",
-            "priority": 0.99 - i * 0.01,
-            "tags": ["replication"] + idea.get("tags", []),
-            "edits": idea.get("edits", []),
-            "metadata": {"replication_of": idea.get("id"), "seed": i},
-        }
-        backlog.append(paths.backlog_jsonl, rep)
-    journal.emit(paths.journal_jsonl, "replication_scheduled",
-                 of=idea.get("id"), n=config.targets.replication_n)
-
-
-def _advance_baseline(
-    config: Config,
-    plan: PatchPlan,
-    metrics: LogMetrics,
-    *,
-    n: int,
-    mean_loss: float,
-) -> None:
-    paths = config.paths
-    best = Best(
-        train_time_ms=metrics.final.train_time_ms,
-        val_loss=mean_loss,
-        run_id=None,
-        patch_branch=None,
-        n_seeds_confirmed=n,
-        confirmed_at=_utc_now(),
-        notes=plan.hypothesis,
-    )
-    save_best(paths.best_json, best)
-    journal.emit(paths.journal_jsonl, "baseline_advanced",
-                 train_time_ms=best.train_time_ms,
-                 val_loss=best.val_loss,
-                 n_seeds=n,
-                 hypothesis=plan.hypothesis)
 
 
 def _metrics_dict(metrics: LogMetrics) -> dict:
@@ -359,15 +368,17 @@ def _recover_in_flight(config: Config) -> None:
         (run_dir / "stderr.tail.txt").write_text(
             f"recovered as crash: was in phase {cursor.phase} when daemon died\n"
         )
-    workspace.remove(config, cursor.run_id)
+    try:
+        workspace.remove(config, cursor.run_id)
+    except Exception:
+        pass
     journal.emit(config.paths.journal_jsonl, "crash_recovered", run_id=cursor.run_id, phase=cursor.phase)
     clear_cursor(config.paths.cursor_json)
 
 
 def _install_signal_handlers() -> None:
     def graceful(signum, frame):
-        log.info("Received signal %s; finishing iteration before exit.", signum)
-        # We don't preempt mid-iteration; we just let the loop exit naturally.
+        log.info("Received signal %s; will exit after current iteration.", signum)
         sys.exit(0)
     signal.signal(signal.SIGTERM, graceful)
     signal.signal(signal.SIGINT, graceful)

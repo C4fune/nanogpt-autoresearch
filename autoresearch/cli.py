@@ -49,6 +49,9 @@ def main(argv: list[str] | None = None) -> int:
     p_base.add_argument("--log", required=True, help="Path to logs/<uuid>.txt from a clean run")
     p_base.add_argument("--note", default="measured baseline (no-op patch)")
 
+    p_cal = sub.add_parser("calibrate", help="Compare a clean training log to upstream record reference")
+    p_cal.add_argument("--log", required=True, help="Path to logs/<uuid>.txt from an unmodified run")
+
     args = parser.parse_args(argv)
     config = load_config()
 
@@ -74,24 +77,38 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "baseline":
         from autoresearch.state import Best, save_best
+        from autoresearch.runner.workspace import current_baseline_sha
+
         m = parse_log(args.log)
         if not m.final or m.final.val_loss != m.final.val_loss:
             print(f"ERROR: log {args.log} has no final val_loss; refusing to set baseline.")
             return 2
+
+        # Record the upstream HEAD sha so subsequent worktrees branch from it.
+        try:
+            head_sha = current_baseline_sha(config)
+        except Exception:
+            head_sha = None
+
         best = Best(
             train_time_ms=m.final.train_time_ms,
             val_loss=m.final.val_loss,
             run_id="manual_baseline",
             patch_branch=None,
+            baseline_commit_sha=head_sha,
             n_seeds_confirmed=1,
+            n_wins_chain=0,
             confirmed_at=None,
             notes=args.note,
         )
         save_best(config.paths.best_json, best)
-        # Also override the static target so daemon goal-checking uses real hardware time.
-        config.targets.baseline_train_time_ms = m.final.train_time_ms
-        config.targets.baseline_val_loss = m.final.val_loss
-        print(f"baseline recorded: train_time={m.final.train_time_ms}ms val_loss={m.final.val_loss:.4f}")
+        print(f"baseline recorded: train_time={m.final.train_time_ms}ms val_loss={m.final.val_loss:.4f} parent_sha={head_sha[:12] if head_sha else 'n/a'}")
+        return 0
+
+    if args.cmd == "calibrate":
+        from autoresearch.calibration import format_report, record_calibration
+        cal = record_calibration(config, Path(args.log))
+        print(format_report(cal))
         return 0
 
     if args.cmd == "run":

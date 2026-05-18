@@ -29,11 +29,16 @@ class RunResult:
 
 
 def run_training(wt_path: Path, config: Config, run_dir: Path) -> RunResult:
-    """Run `./run.sh` in worktree; copy the produced log into run_dir/log.txt.gz."""
+    """Run `./run.sh` in worktree; copy the produced log into run_dir/log.txt.gz.
+
+    DATA_PATH points to the main repo (which holds data/fineweb10B/*.bin shards),
+    NOT the worktree. Worktrees share .git but the binary data shards are gitignored
+    and only exist in the main checkout.
+    """
     logs_before = _list_logs(wt_path)
     t0 = time.monotonic()
     env = os.environ.copy()
-    env.setdefault("DATA_PATH", str(wt_path))
+    env["DATA_PATH"] = str(config.repo_root)
 
     try:
         proc = subprocess.run(

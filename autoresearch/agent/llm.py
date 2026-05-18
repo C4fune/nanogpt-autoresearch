@@ -40,7 +40,7 @@ class AnthropicClient:
         max_tokens: int = 4096,
     ) -> None:
         # Default to the most capable model; user can override via AUTORESEARCH_MODEL.
-        self.model = model or os.environ.get("AUTORESEARCH_MODEL", "claude-opus-4-5")
+        self.model = model or os.environ.get("AUTORESEARCH_MODEL", "claude-opus-4-7")
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.temperature = temperature
         self.max_tokens = max_tokens
