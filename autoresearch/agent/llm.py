@@ -83,12 +83,13 @@ class AnthropicClient:
             "messages": [{"role": "user", "content": user}],
         }
         if self._supports_thinking():
-            # Extended thinking: model emits visible reasoning before the answer.
-            # API rejects `temperature` here, so don't set it.
-            kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": self.thinking_budget_tokens,
-            }
+            # Extended thinking on opus-4-7+. The API surface here uses
+            # adaptive thinking + output_config.effort; the old
+            # `thinking.type=enabled, budget_tokens=...` form is rejected.
+            # Temperature is also rejected for these models, so don't set it.
+            effort = os.environ.get("AUTORESEARCH_THINKING_EFFORT", "high")
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": effort}
         else:
             kwargs["temperature"] = self.temperature
 
