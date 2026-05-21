@@ -35,7 +35,10 @@ class LLMBudget:
     lessons_chars: int = 3_000
     code_map_chars: int = 2_000
     summaries_chars: int = 8_000      # last ~10 run summaries
-    record_index_chars: int = 4_000   # ~5 most relevant record cards
+    # Bumped: rich record cards (with descriptions + contributors) are 200-400
+    # chars each, and we want the planner to see ~20 most-recent records so it
+    # can trace the SOTA arc and propose non-obvious next moves.
+    record_index_chars: int = 10_000
     code_excerpt_chars: int = 8_000   # on-demand source slice
     # Long-horizon memory blocks (sourced from run_db / pending_wins):
     wins_chain_chars: int = 2_500     # advanced wins, in chain order

@@ -341,14 +341,29 @@ def _cmd_traces(config, *, last: int, run_id: str | None, purpose: str | None, f
         if not r.get("ok", True):
             head += f"  ERROR={r.get('error','?')[:120]}"
         print(head)
+        thinking = r.get("thinking", "")
+        usage = r.get("usage", {}) or {}
+        if usage:
+            print(
+                f"  tokens:       in={usage.get('input_tokens','?')} "
+                f"out={usage.get('output_tokens','?')} "
+                f"thinking_chars={r.get('thinking_chars',0)}"
+            )
         if full:
             print("--- SYSTEM ---")
             print(r.get("system", ""))
             print("--- USER ---")
             print(r.get("user", ""))
+            if thinking:
+                print("--- THINKING ---")
+                print(thinking)
             print("--- RESPONSE ---")
             print(r.get("response", ""))
         else:
+            if thinking:
+                think_lines = thinking.strip().splitlines()
+                head = " ".join(think_lines[:3])[:280]
+                print(f"  thinking:     {head}")
             print(f"  user head:    {(r.get('user','') or '').splitlines()[0][:200] if r.get('user') else ''}")
             resp_head = (r.get("response") or "").strip().splitlines()
             print(f"  resp head:    {(resp_head[0] if resp_head else '')[:200]}")

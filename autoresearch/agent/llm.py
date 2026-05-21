@@ -37,7 +37,13 @@ def default_client(temperature: float = 0.4) -> "LLMClient":
 
 
 class AnthropicClient:
-    """Anthropic Messages API. Default model: claude-opus-4-7."""
+    """Anthropic Messages API. Default model: claude-opus-4-7.
+
+    Extended thinking is enabled on claude-opus-4-7+ — the model's reasoning
+    is returned as `thinking` content blocks and exposed on `self.last_thinking`.
+    The tracer copies it into each traces.jsonl row so the user can see the
+    full thought process behind every decision.
+    """
 
     def __init__(
         self,
@@ -45,13 +51,21 @@ class AnthropicClient:
         model: str | None = None,
         api_key: str | None = None,
         temperature: float = 0.4,
-        max_tokens: int = 4096,
+        max_tokens: int = 16000,
+        thinking_budget_tokens: int = 8000,
     ) -> None:
         # Default to the most capable model; user can override via AUTORESEARCH_MODEL.
         self.model = model or os.environ.get("AUTORESEARCH_MODEL", "claude-opus-4-7")
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.thinking_budget_tokens = thinking_budget_tokens
+        # Populated after each complete() call so LLMTracer can record it.
+        self.last_thinking: str = ""
+        self.last_usage: dict | None = None
+
+    def _supports_thinking(self) -> bool:
+        return self.model.startswith(("claude-opus-4-7", "claude-sonnet-4-7", "claude-haiku-4-7"))
 
     def complete(self, system: str, user: str) -> str:
         if not self.api_key:
@@ -62,24 +76,46 @@ class AnthropicClient:
             raise RuntimeError("pip install anthropic") from e
 
         client = anthropic.Anthropic(api_key=self.api_key)
-        # Newer Claude models (opus-4-7+) reject `temperature` as deprecated.
-        # Pass it only on models that still accept it.
-        kwargs = {
+        kwargs: dict = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }
-        if not self.model.startswith(("claude-opus-4-7", "claude-sonnet-4-7", "claude-haiku-4-7")):
+        if self._supports_thinking():
+            # Extended thinking: model emits visible reasoning before the answer.
+            # API rejects `temperature` here, so don't set it.
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.thinking_budget_tokens,
+            }
+        else:
             kwargs["temperature"] = self.temperature
+
         resp = client.messages.create(**kwargs)
-        # Concatenate text blocks (resp.content is a list of content blocks).
-        parts: list[str] = []
+
+        # Split content into thinking + text. Thinking is the model's reasoning;
+        # text is the actual response payload (JSON ideas, distillation, etc.).
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
         for block in resp.content:
-            text = getattr(block, "text", None)
-            if text:
-                parts.append(text)
-        return "".join(parts)
+            btype = getattr(block, "type", None)
+            if btype == "thinking":
+                t = getattr(block, "thinking", None)
+                if t:
+                    thinking_parts.append(t)
+            elif btype == "text" or getattr(block, "text", None) is not None:
+                t = getattr(block, "text", None)
+                if t:
+                    text_parts.append(t)
+
+        self.last_thinking = "".join(thinking_parts)
+        usage = getattr(resp, "usage", None)
+        self.last_usage = {
+            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
+            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+        }
+        return "".join(text_parts)
 
 
 class OpenAICompatibleClient:
@@ -233,6 +269,14 @@ class LLMTracer:
             response = self.inner.complete(system, user)
             rec["response"] = _clip(response)
             rec["response_chars"] = len(response)
+            # Capture extended thinking + token usage if the wrapped client exposes them.
+            thinking = getattr(self.inner, "last_thinking", "") or ""
+            if thinking:
+                rec["thinking"] = _clip(thinking)
+                rec["thinking_chars"] = len(thinking)
+            usage = getattr(self.inner, "last_usage", None)
+            if usage:
+                rec["usage"] = usage
             rec["ok"] = True
             return response
         except Exception as e:

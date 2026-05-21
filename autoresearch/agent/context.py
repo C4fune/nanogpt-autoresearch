@@ -79,7 +79,8 @@ def build(config: Config, *, run_db: RunDB | None = None) -> HotContext:
     add("Lessons", _safe_read(paths.lessons_md, "(none yet)"), budget.lessons_chars)
     add("Code map", _safe_read(paths.code_map_md, "(no code map; run bootstrap)"), budget.code_map_chars)
     add("Recent run summaries (last 10)", _recent_summaries(paths, n=10), budget.summaries_chars)
-    add("Top record cards", _record_cards(paths, k=5), budget.record_index_chars)
+    add("World records (latest first — STUDY this for SOTA evolution)",
+        _record_cards(paths, k=20), budget.record_index_chars)
     add("Backlog (pending)", _backlog_preview(paths, k=8), 1500)
 
     text = "\n".join(parts)
@@ -110,7 +111,9 @@ def _recent_summaries(paths: Paths, n: int) -> str:
 
 
 def _record_cards(paths: Paths, k: int) -> str:
-    """Top-k record cards by tags/recency. Cheap heuristic: most recent wins."""
+    """Top-k record cards by recency. Each card surfaces the human description
+    extracted from the upstream README so the planner can study the SOTA arc.
+    """
     if not paths.record_index_jsonl.exists():
         return "(record index not built; run bootstrap)"
     cards = []
@@ -122,12 +125,23 @@ def _record_cards(paths: Paths, k: int) -> str:
             cards.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    cards.sort(key=lambda c: c.get("date", ""), reverse=True)
+    # Sort by record_number descending (then date) so latest SOTA leads.
+    cards.sort(
+        key=lambda c: (c.get("record_number") or -1, c.get("date") or ""),
+        reverse=True,
+    )
     out = []
     for c in cards[:k]:
+        n = c.get("record_number")
+        prefix = f"#{n:>2}" if n is not None else "  ?"
+        rt = c.get("record_time") or ""
+        val = c.get("val_loss")
+        tms = c.get("train_time_ms")
+        desc = c.get("description") or c.get("summary", "")[:200]
+        contrib = c.get("contributors") or ""
         out.append(
-            f"- {c.get('folder')}: {c.get('summary', '')[:300]}"
-            f" (val={c.get('val_loss')}, time={c.get('train_time_ms')}ms)"
+            f"- {prefix} {rt:<14s} {desc}\n"
+            f"     val={val}  measured_t={tms}ms  by {contrib}"
         )
     return "\n".join(out) or "(no records indexed)"
 
