@@ -2,6 +2,11 @@
 
 Key invariant: this function never reads a full training log or the full source
 of train_gpt.py. It assembles short, pre-distilled artifacts.
+
+After a week of 24/7 operation the lessons.md and recent-summaries alone are
+not enough — the planner needs to see (a) the full wins chain, (b) per-category
+attempt rollup, (c) which patches we've ALREADY tried (dedup hints), (d) the
+dominant crash signatures. All four come from run_db.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ from pathlib import Path
 
 from autoresearch.config import Config
 from autoresearch.paths import Paths
+from autoresearch.run_db import RunDB
 
 RULES_HEADER = """\
 # Speedrun rules (Track 1) — hard constraints
@@ -43,7 +49,7 @@ class HotContext:
     sections: tuple[str, ...]
 
 
-def build(config: Config) -> HotContext:
+def build(config: Config, *, run_db: RunDB | None = None) -> HotContext:
     paths = config.paths
     budget = config.llm
     parts: list[str] = []
@@ -64,6 +70,12 @@ def build(config: Config) -> HotContext:
 
     add("Rules", RULES_HEADER, budget.rules_chars)
     add("Current state", _state_block(config), budget.state_chars)
+    add("Wins chain (advanced, oldest→newest)", _wins_chain(config), budget.wins_chain_chars)
+    add("Category stats (non-replication attempts)",
+        _category_stats(run_db), budget.category_stats_chars)
+    add("Already-attempted patches — do NOT repeat",
+        _dedup_hints(run_db), budget.dedup_hints_chars)
+    add("Top crash signatures", _failure_signatures(run_db), budget.failure_sig_chars)
     add("Lessons", _safe_read(paths.lessons_md, "(none yet)"), budget.lessons_chars)
     add("Code map", _safe_read(paths.code_map_md, "(no code map; run bootstrap)"), budget.code_map_chars)
     add("Recent run summaries (last 10)", _recent_summaries(paths, n=10), budget.summaries_chars)
@@ -140,6 +152,82 @@ def _backlog_preview(paths: Paths, k: int) -> str:
         f"- [{i.get('priority', 0):.2f}] {i.get('hypothesis', '')[:150]}"
         for i in items
     )
+
+
+def _wins_chain(config: Config) -> str:
+    """Render every ADVANCED win (from pending_wins.json) in chain order.
+
+    This is the agent's cumulative PR history — what we've already shipped.
+    Distinct from `lessons.md` (compressed prose) and `Recent run summaries`
+    (last 10 attempts of any kind).
+    """
+    p = config.paths.state_dir / "pending_wins.json"
+    if not p.exists():
+        return "(no wins yet — agent is still pre-first-win)"
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "(pending_wins.json unreadable)"
+    advanced = [
+        b for b in data.get("batches", {}).values()
+        if b.get("status") == "advanced"
+    ]
+    advanced.sort(key=lambda b: b.get("created_at", ""))
+    if not advanced:
+        return "(no advanced wins yet)"
+    rows = []
+    for i, b in enumerate(advanced, 1):
+        m = b.get("candidate_metrics", {}) or {}
+        rows.append(
+            f"{i:>2}. [{b.get('classification', '?'):8s}] "
+            f"t={m.get('train_time_ms', '?')}ms "
+            f"val={m.get('val_loss', '?')} — {(b.get('hypothesis') or '')[:120]}"
+        )
+    return "\n".join(rows)
+
+
+def _category_stats(run_db: RunDB | None) -> str:
+    if run_db is None or not run_db.records:
+        return "(no run history yet)"
+    stats = run_db.category_stats()
+    if not stats:
+        return "(no non-replication attempts yet)"
+    rows = []
+    for cat in sorted(stats):
+        s = stats[cat]
+        total = s.get("_total", 0)
+        wins = s.get("win", 0)
+        losses = s.get("loss", 0)
+        crashes = s.get("crash", 0)
+        rejected = s.get("patch_rejected", 0) + s.get("precheck_failed", 0)
+        invalid = s.get("invalid_loss", 0)
+        win_rate = (wins / total * 100) if total else 0.0
+        rows.append(
+            f"- {cat:12s} n={total:>3}  wins={wins:>2} "
+            f"loss={losses:>2} crash={crashes:>2} rejected={rejected:>2} "
+            f"invalid_loss={invalid:>2}  win_rate={win_rate:.0f}%"
+        )
+    return "\n".join(rows)
+
+
+def _dedup_hints(run_db: RunDB | None) -> str:
+    if run_db is None:
+        return "(no run_db)"
+    hints = run_db.recent_dedup_hints(n=15)
+    if not hints:
+        return "(no prior attempts to dedup against)"
+    rows = [f"- [{h} {verdict:14s}] {snippet}" for h, verdict, snippet in hints]
+    rows.insert(0, "Identical patches will be auto-rejected at intake; cite a NEW angle:")
+    return "\n".join(rows)
+
+
+def _failure_signatures(run_db: RunDB | None) -> str:
+    if run_db is None:
+        return "(no run_db)"
+    sigs = run_db.failure_signatures(n=6)
+    if not sigs:
+        return "(no recent crashes — proceed normally)"
+    return "\n".join(f"- ×{count:<3} {sig}" for sig, count in sigs.items())
 
 
 def _safe_read(path: Path, fallback: str = "") -> str:

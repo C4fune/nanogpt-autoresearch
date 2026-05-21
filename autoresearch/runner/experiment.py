@@ -34,11 +34,18 @@ def run_training(wt_path: Path, config: Config, run_dir: Path) -> RunResult:
     DATA_PATH points to the main repo (which holds data/fineweb10B/*.bin shards),
     NOT the worktree. Worktrees share .git but the binary data shards are gitignored
     and only exist in the main checkout.
+
+    TORCHINDUCTOR_CACHE_DIR is pinned to a shared repo-local path so that
+    torch.compile artifacts persist across worktrees. Without this, every new
+    worktree triggers a fresh ~7-minute compile — a 24/7 daemon would burn
+    ~10 hours/day on redundant compilation.
     """
     logs_before = _list_logs(wt_path)
     t0 = time.monotonic()
     env = os.environ.copy()
     env["DATA_PATH"] = str(config.repo_root)
+    env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(config.paths.inductor_cache_dir))
+    env.setdefault("TRITON_CACHE_DIR", str(config.paths.inductor_cache_dir / "triton"))
 
     try:
         proc = subprocess.run(

@@ -33,7 +33,7 @@ def py_compile_check(path: Path) -> PrecheckResult:
 
 
 def import_smoke_check(repo_root: Path, file_rel: str = "train_gpt.py", timeout_s: int = 30) -> PrecheckResult:
-    """Parse + AST-check via `python -c "compile(...)"`. Avoids running torch."""
+    """Parse + AST-check via `python -c "ast.parse(...)"`. Avoids running torch."""
     cmd = [
         sys.executable,
         "-c",
@@ -48,9 +48,9 @@ def import_smoke_check(repo_root: Path, file_rel: str = "train_gpt.py", timeout_
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return PrecheckResult(False, "import_smoke", f"timeout after {timeout_s}s")
+        return PrecheckResult(False, "import_smoke", f"timeout after {timeout_s}s: {file_rel}")
     if proc.returncode != 0:
-        return PrecheckResult(False, "import_smoke", (proc.stderr or proc.stdout)[-2000:])
+        return PrecheckResult(False, "import_smoke", f"{file_rel}:\n{(proc.stderr or proc.stdout)[-2000:]}")
     return PrecheckResult(True, "import_smoke")
 
 
@@ -60,7 +60,10 @@ def run_all(repo_root: Path, files: tuple[str, ...]) -> PrecheckResult:
         r = py_compile_check(path)
         if not r.ok:
             return r
-    r = import_smoke_check(repo_root, "train_gpt.py")
-    if not r.ok:
-        return r
+    # AST-parse every editable file, not just train_gpt.py. A syntax error in
+    # triton_kernels.py would otherwise slip through and burn ~10 min of GPU.
+    for f in files:
+        r = import_smoke_check(repo_root, f)
+        if not r.ok:
+            return r
     return PrecheckResult(True, "passed")

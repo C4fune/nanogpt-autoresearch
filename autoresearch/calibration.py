@@ -38,7 +38,11 @@ class Calibration:
 
 
 WARN_DEVIATION_PCT = 5.0
-BLOCK_DEVIATION_PCT = 25.0
+# Default block threshold. The local records/ folder can lag the upstream
+# train_gpt.py by several versions, which inflates measured deviation even on
+# identical hardware. Override with AUTORESEARCH_CAL_BLOCK_PCT when the fork is
+# significantly ahead of the records you have on disk.
+BLOCK_DEVIATION_PCT = float(os.environ.get("AUTORESEARCH_CAL_BLOCK_PCT", "25.0"))
 
 
 def _utc_now() -> str:
@@ -135,19 +139,26 @@ def assert_calibrated(config: Config) -> None:
     if abs(cal.deviation_pct) > BLOCK_DEVIATION_PCT:
         raise RuntimeError(
             f"Hardware deviates {cal.deviation_pct:+.1f}% from reference "
-            f"({cal.reference_train_time_ms}ms vs measured {cal.measured_train_time_ms}ms). "
-            f"Wins on this box may not generalize to leaderboard hardware. "
-            f"Set AUTORESEARCH_SKIP_CALIBRATION=1 to override (not recommended)."
+            f"({cal.reference_train_time_ms}ms vs measured {cal.measured_train_time_ms}ms; "
+            f"reference={cal.reference_source}).\n"
+            f"  - If you actually have 8x H100s, this usually means the local records/ "
+            f"folder lags the current train_gpt.py. Either update records/, or raise "
+            f"the block threshold with AUTORESEARCH_CAL_BLOCK_PCT (e.g. 40).\n"
+            f"  - Wins on mismatched hardware will not generalize to the leaderboard.\n"
+            f"  - Last-resort override: AUTORESEARCH_SKIP_CALIBRATION=1."
         )
 
 
 def format_report(cal: Calibration) -> str:
     if abs(cal.deviation_pct) <= WARN_DEVIATION_PCT:
-        verdict = "OK — within 5% of reference"
+        verdict = f"OK — within {WARN_DEVIATION_PCT:.0f}% of reference"
     elif abs(cal.deviation_pct) <= BLOCK_DEVIATION_PCT:
-        verdict = "WARN — within 25% but >5%; wins still trustworthy directionally"
+        verdict = (
+            f"WARN — within {BLOCK_DEVIATION_PCT:.0f}% but >{WARN_DEVIATION_PCT:.0f}%; "
+            "wins still trustworthy directionally"
+        )
     else:
-        verdict = "BLOCK — >25% off; daemon will refuse to start"
+        verdict = f"BLOCK — >{BLOCK_DEVIATION_PCT:.0f}% off; daemon will refuse to start"
     return (
         f"Calibration\n"
         f"  measured: {cal.measured_train_time_ms}ms (val_loss={cal.measured_val_loss:.4f})\n"

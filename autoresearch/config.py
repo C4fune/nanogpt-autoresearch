@@ -37,6 +37,11 @@ class LLMBudget:
     summaries_chars: int = 8_000      # last ~10 run summaries
     record_index_chars: int = 4_000   # ~5 most relevant record cards
     code_excerpt_chars: int = 8_000   # on-demand source slice
+    # Long-horizon memory blocks (sourced from run_db / pending_wins):
+    wins_chain_chars: int = 2_500     # advanced wins, in chain order
+    category_stats_chars: int = 800   # per-category attempt/win rollup
+    dedup_hints_chars: int = 2_000    # "we already tried these patches" head list
+    failure_sig_chars: int = 1_000    # frequent crash signatures
     backlog_low_threshold: int = 5    # refill when fewer than this remain
 
 
@@ -49,7 +54,11 @@ class Config:
 
     editable_files: tuple[str, ...] = ("train_gpt.py", "triton_kernels.py")
     run_command: tuple[str, ...] = ("./run.sh",)
-    run_timeout_s: int = 1800             # ~30 min: full attempt + compile slack
+    # README warns torch.compile alone is ~7 min on a cold inductor cache.
+    # Pad generously: a first-ever run on a fresh box is ~10 min compile +
+    # ~1.5 min train + warmup; pathological compile blowups need headroom.
+    # Override via AUTORESEARCH_RUN_TIMEOUT_S.
+    run_timeout_s: int = 3000             # 50 min
     keep_last_n_logs: int = 200           # gzip kept; older deleted
     compact_every_n_runs: int = 25
     distill_word_target: int = 150
@@ -60,6 +69,9 @@ class Config:
         env_ms = os.environ.get("AUTORESEARCH_BASELINE_MS")
         if env_ms:
             self.targets.baseline_train_time_ms = int(env_ms)
+        env_timeout = os.environ.get("AUTORESEARCH_RUN_TIMEOUT_S")
+        if env_timeout:
+            self.run_timeout_s = int(env_timeout)
 
 
 def load_config() -> Config:

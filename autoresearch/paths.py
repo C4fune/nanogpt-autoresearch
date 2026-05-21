@@ -74,6 +74,21 @@ class Paths:
     def journal_jsonl(self) -> Path:
         return self.root / "journal.jsonl"
 
+    # every LLM call recorded here for full agent observability
+    @property
+    def traces_jsonl(self) -> Path:
+        return self.root / "traces.jsonl"
+
+    # structured run database (long-horizon memory)
+    @property
+    def run_db_jsonl(self) -> Path:
+        return self.root / "runs.jsonl"
+
+    # shared torch.compile cache — pinned so worktrees reuse it
+    @property
+    def inductor_cache_dir(self) -> Path:
+        return self.root / "inductor_cache"
+
     # ephemeral worktrees (one per attempt)
     @property
     def worktrees_dir(self) -> Path:
@@ -89,5 +104,6 @@ class Paths:
             self.ideas_dir,
             self.runs_dir,
             self.worktrees_dir,
+            self.inductor_cache_dir,
         ):
             p.mkdir(parents=True, exist_ok=True)

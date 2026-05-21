@@ -35,13 +35,14 @@ from pathlib import Path
 
 from autoresearch import backlog, journal, winners
 from autoresearch.agent import compactor, distiller, planner
-from autoresearch.agent.llm import DryRunClient, LLMClient, default_client
+from autoresearch.agent.llm import DryRunClient, LLMClient, LLMTracer, default_client
 from autoresearch.agent.mutator import MutatorError, PatchPlan, apply_plan, parse_plan_json
 from autoresearch.calibration import assert_calibrated
 from autoresearch.config import Config
 from autoresearch.parser.log_parser import LogMetrics, compact_log_summary
 from autoresearch.prechecks import run_all as run_prechecks
 from autoresearch.rules import classify_patch
+from autoresearch.run_db import RunDB, RunRecord, edits_hash, hypothesis_hash
 from autoresearch.runner import experiment, workspace
 from autoresearch.state import (
     Cursor,
@@ -52,6 +53,12 @@ from autoresearch.state import (
     save_budget,
     save_cursor,
 )
+
+
+# Escalation policy for stuck loops. Without this the daemon will quietly emit
+# `backlog_empty` 24/7 if (e.g.) the LLM is rate-limited or proposing only dups.
+STUCK_THRESHOLD = 5            # consecutive failed refills before escalating
+STUCK_SLEEP_S = 300            # back off this long once escalated
 
 log = logging.getLogger(__name__)
 
@@ -69,35 +76,78 @@ def run_daemon(
         # Refuse to start on uncalibrated hardware (or |deviation|>25%).
         assert_calibrated(config)
 
-    llm: LLMClient = DryRunClient() if dry_run else default_client()
+    inner_llm: LLMClient = DryRunClient() if dry_run else default_client()
+    # Every LLM call goes through the tracer so prompts + responses are durably
+    # recorded under .autoresearch/traces.jsonl and mirrored into the per-run
+    # llm_calls.jsonl. Required for after-the-fact debugging of any iteration.
+    llm = LLMTracer(inner_llm, traces_path=paths.traces_jsonl, runs_dir=paths.runs_dir)
 
     _install_signal_handlers()
     _recover_in_flight(config)
 
-    journal.emit(paths.journal_jsonl, "daemon_started", dry_run=dry_run)
+    run_db = RunDB.load(paths.run_db_jsonl)
+    journal.emit(
+        paths.journal_jsonl, "daemon_started",
+        dry_run=dry_run, run_db_size=len(run_db.records),
+        model=llm.model,
+    )
 
     iteration = 0
+    consecutive_no_progress = 0
     while True:
         if max_iterations is not None and iteration >= max_iterations:
             journal.emit(paths.journal_jsonl, "daemon_stopped", reason="max_iterations")
             return
 
         try:
-            _maybe_refill_backlog(config, llm)
+            llm.set_tag(purpose="planner")
+            _maybe_refill_backlog(config, llm, run_db=run_db)
         except Exception as e:
             journal.emit(paths.journal_jsonl, "planner_error", error=str(e))
             log.exception("planner refill failed; sleeping before retry")
             time.sleep(15)
             continue
+        finally:
+            llm.clear_tag()
 
         idea = backlog.pop_next(paths.backlog_jsonl)
         if idea is None:
-            journal.emit(paths.journal_jsonl, "backlog_empty")
-            log.warning("backlog empty after refill attempt; sleeping 30s")
-            time.sleep(30)
+            consecutive_no_progress += 1
+            journal.emit(
+                paths.journal_jsonl, "backlog_empty",
+                consecutive=consecutive_no_progress,
+            )
+            if consecutive_no_progress >= STUCK_THRESHOLD:
+                # Either LLM is mute or every proposal is a dedup hit. Don't
+                # busy-loop — back off and surface a visible alert.
+                journal.emit(
+                    paths.journal_jsonl, "health_alert",
+                    kind="stuck_backlog_empty",
+                    consecutive=consecutive_no_progress,
+                    sleep_s=STUCK_SLEEP_S,
+                )
+                log.error(
+                    "STUCK: %d consecutive empty refills; backing off %ds",
+                    consecutive_no_progress, STUCK_SLEEP_S,
+                )
+                time.sleep(STUCK_SLEEP_S)
+            else:
+                log.warning("backlog empty after refill attempt; sleeping 30s")
+                time.sleep(30)
             continue
 
-        _execute_iteration(config, llm, idea, dry_run=dry_run)
+        consecutive_no_progress = 0
+        try:
+            _execute_iteration(config, llm, idea, dry_run=dry_run, run_db=run_db)
+        except Exception as e:
+            # A malformed planner idea (missing hypothesis, broken edits) used to
+            # raise out of _idea_to_plan and kill the daemon. Catch here, log,
+            # journal, and keep iterating — one bad idea must not stop the loop.
+            log.exception("iteration crashed at top level (idea=%s)", idea.get("id"))
+            journal.emit(
+                paths.journal_jsonl, "iteration_crash_caught",
+                idea_id=idea.get("id"), error=str(e),
+            )
 
         # Aggregate any batches whose replications are now complete.
         try:
@@ -113,10 +163,13 @@ def run_daemon(
         budget = load_budget(paths.budget_json)
         if budget.runs_completed % config.compact_every_n_runs == 0 and budget.runs_completed > 0:
             try:
+                llm.set_tag(purpose="compactor")
                 compactor.compact_lessons(config=config, llm=llm)
                 journal.emit(paths.journal_jsonl, "lessons_compacted")
             except Exception as e:
                 journal.emit(paths.journal_jsonl, "compactor_error", error=str(e))
+            finally:
+                llm.clear_tag()
 
         experiment.prune_old_logs(config)
 
@@ -124,7 +177,14 @@ def run_daemon(
 # ----- single iteration -------------------------------------------------------
 
 
-def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: bool) -> None:
+def _execute_iteration(
+    config: Config,
+    llm: LLMClient,
+    idea: dict,
+    *,
+    dry_run: bool,
+    run_db: RunDB | None = None,
+) -> None:
     paths = config.paths
     run_id = _new_run_id()
     save_cursor(paths.cursor_json, Cursor(run_id=run_id, started_at=_utc_now(), phase="patching"))
@@ -215,6 +275,10 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
                 pass
 
         try:
+            # Tag this LLM call so the trace lands in runs/<id>/llm_calls.jsonl
+            # as well as the global trace stream — same row in both places.
+            if hasattr(llm, "set_tag"):
+                llm.set_tag(purpose="distill", run_id=run_id)
             distiller.distill_run(
                 config=config,
                 llm=llm,
@@ -231,6 +295,9 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
             (run_dir / "summary.md").write_text(
                 f"verdict={verdict}\nerror={error or ''}\nfallback (distiller failed: {e})\n"
             )
+        finally:
+            if hasattr(llm, "clear_tag"):
+                llm.clear_tag()
 
         # Tick budget counter (informational only).
         budget = load_budget(paths.budget_json)
@@ -304,12 +371,46 @@ def _execute_iteration(config: Config, llm: LLMClient, idea: dict, *, dry_run: b
             is_replication=is_replication,
         )
 
+        # Persist the canonical row to long-horizon memory. Used by planner dedup,
+        # category stats, and the wins-chain renderer next iteration.
+        if run_db is not None:
+            edits = idea.get("edits", []) or []
+            md = idea.get("metadata") or {}
+            try:
+                added_lines, removed_lines = (
+                    (metrics_dict or {}).get("diff_lines_added"),
+                    (metrics_dict or {}).get("diff_lines_removed"),
+                )
+                run_db.append(RunRecord(
+                    run_id=run_id,
+                    ts=_utc_now(),
+                    parent_sha=parent_sha,
+                    category=idea.get("category", "mixed"),
+                    hypothesis=idea.get("hypothesis", ""),
+                    edits_hash=edits_hash(edits),
+                    hypothesis_hash=hypothesis_hash(idea.get("hypothesis", "")),
+                    verdict=verdict,
+                    val_loss=(metrics.final.val_loss if metrics and metrics.final else None),
+                    train_time_ms=(metrics.final.train_time_ms if metrics and metrics.final else None),
+                    duration_s=duration_s,
+                    is_replication=is_replication,
+                    batch_id=md.get("replication_of_batch"),
+                    replication_of=md.get("replication_of_run_id"),
+                    error=error,
+                    diff_lines_added=added_lines,
+                    diff_lines_removed=removed_lines,
+                ))
+            except Exception as e:
+                # Memory write must not break the loop — log and continue.
+                log.exception("run_db append failed for %s", run_id)
+                journal.emit(paths.journal_jsonl, "run_db_error", run_id=run_id, error=str(e))
+
 
 # ----- helpers ----------------------------------------------------------------
 
 
-def _maybe_refill_backlog(config: Config, llm: LLMClient) -> None:
-    added = planner.refill_backlog_if_needed(config, llm)
+def _maybe_refill_backlog(config: Config, llm: LLMClient, *, run_db: RunDB | None = None) -> None:
+    added = planner.refill_backlog_if_needed(config, llm, run_db=run_db)
     if added:
         journal.emit(config.paths.journal_jsonl, "backlog_refilled", added=added)
 
@@ -365,9 +466,12 @@ def _recover_in_flight(config: Config) -> None:
         verdict_path = run_dir / "verdict"
         if not verdict_path.exists():
             verdict_path.write_text("crash\n")
-        (run_dir / "stderr.tail.txt").write_text(
-            f"recovered as crash: was in phase {cursor.phase} when daemon died\n"
-        )
+        # Prepend recovery marker rather than overwriting — preserves whatever
+        # stderr tail was already on disk so we still have the cause of death.
+        marker = f"recovered as crash: was in phase {cursor.phase} when daemon died\n"
+        stderr_path = run_dir / "stderr.tail.txt"
+        prior = stderr_path.read_text() if stderr_path.exists() else ""
+        stderr_path.write_text(marker + ("--- prior stderr tail ---\n" + prior if prior else ""))
     try:
         workspace.remove(config, cursor.run_id)
     except Exception:
