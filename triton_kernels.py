@@ -701,11 +701,15 @@ struct __align__(8) __nv_fp8_e5m28 {
 
 template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
 
+// Hardware-compat hotfix: __tanhf requires CUDA 12.8+ headers, but our box's
+// NVIDIA driver tops out at CUDA 12.6. Reverted to the __expf variant which
+// is mathematically identical and ships in every supported CUDA toolkit.
+// Original (faster on driver >= 570):
 //__device__ float sigmoid(float x) {
-//  return 1.0f / (1.0f + __expf(-x));
+//  return 0.5f + __tanhf(x * 0.5f) * 0.5f;
 //}
 __device__ float sigmoid(float x) {
-  return 0.5f + __tanhf(x * 0.5f) * 0.5f;
+  return 1.0f / (1.0f + __expf(-x));
 }
 
 extern "C"
