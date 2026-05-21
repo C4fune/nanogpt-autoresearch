@@ -62,13 +62,17 @@ class AnthropicClient:
             raise RuntimeError("pip install anthropic") from e
 
         client = anthropic.Anthropic(api_key=self.api_key)
-        resp = client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
+        # Newer Claude models (opus-4-7+) reject `temperature` as deprecated.
+        # Pass it only on models that still accept it.
+        kwargs = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }
+        if not self.model.startswith(("claude-opus-4-7", "claude-sonnet-4-7", "claude-haiku-4-7")):
+            kwargs["temperature"] = self.temperature
+        resp = client.messages.create(**kwargs)
         # Concatenate text blocks (resp.content is a list of content blocks).
         parts: list[str] = []
         for block in resp.content:
