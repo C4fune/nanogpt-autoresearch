@@ -14,11 +14,14 @@ are inspectable via `python -m autoresearch traces` — no run is a black box.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
+
+_log = logging.getLogger(__name__)
 
 
 class LLMClient(Protocol):
@@ -51,18 +54,25 @@ class AnthropicClient:
         model: str | None = None,
         api_key: str | None = None,
         temperature: float = 0.4,
-        max_tokens: int = 16000,
+        max_tokens: int | None = None,
         thinking_budget_tokens: int = 8000,
     ) -> None:
         # Default to the most capable model; user can override via AUTORESEARCH_MODEL.
         self.model = model or os.environ.get("AUTORESEARCH_MODEL", "claude-opus-4-7")
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.temperature = temperature
+        # max_tokens has to cover BOTH thinking AND the JSON response.
+        # With effort=high adaptive thinking, opus-4-7 can burn 30-60k tokens
+        # of reasoning. Default 64k so the actual response isn't truncated.
+        # Override via AUTORESEARCH_MAX_TOKENS.
+        if max_tokens is None:
+            max_tokens = int(os.environ.get("AUTORESEARCH_MAX_TOKENS", "64000"))
         self.max_tokens = max_tokens
         self.thinking_budget_tokens = thinking_budget_tokens
         # Populated after each complete() call so LLMTracer can record it.
         self.last_thinking: str = ""
         self.last_usage: dict | None = None
+        self.last_stop_reason: str | None = None
 
     def _supports_thinking(self) -> bool:
         return self.model.startswith(("claude-opus-4-7", "claude-sonnet-4-7", "claude-haiku-4-7"))
@@ -116,6 +126,7 @@ class AnthropicClient:
             "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
             "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
         }
+        self.last_stop_reason = getattr(resp, "stop_reason", None)
         return "".join(text_parts)
 
 
@@ -278,6 +289,9 @@ class LLMTracer:
             usage = getattr(self.inner, "last_usage", None)
             if usage:
                 rec["usage"] = usage
+            stop = getattr(self.inner, "last_stop_reason", None)
+            if stop:
+                rec["stop_reason"] = stop
             rec["ok"] = True
             return response
         except Exception as e:
@@ -291,6 +305,8 @@ class LLMTracer:
                 run_id = self._tag.get("run_id")
                 if run_id:
                     _append_jsonl(self.runs_dir / run_id / "llm_calls.jsonl", rec)
-            except Exception:
-                # Tracing must NEVER take down the daemon. Swallow + continue.
-                pass
+            except Exception as e:
+                # Tracing must NEVER take down the daemon — but DO log so the
+                # user can see when trace writes fail (silent swallow burned
+                # us before: empty traces.jsonl with no explanation).
+                _log.warning("LLMTracer write failed: %s", e, exc_info=True)
