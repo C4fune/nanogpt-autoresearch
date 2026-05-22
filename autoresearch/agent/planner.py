@@ -120,15 +120,43 @@ def refill_backlog_if_needed(
 
 
 def _parse_ideas(raw: str) -> list[dict[str, Any]]:
+    """Extract the JSON payload from the planner response.
+
+    Opus-4-7 with adaptive thinking sometimes writes prose before the JSON,
+    sometimes wraps it in ```json fences, sometimes mentions stray braces in
+    prose. Try every plausible `{...}` block until one parses AND has "ideas".
+    """
     text = raw.strip()
+    # Strip outer markdown fence if the WHOLE response is a fenced block.
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
+        stripped = re.sub(r"^```(?:json)?\n?", "", text)
+        stripped = re.sub(r"\n?```$", "", stripped)
+        text = stripped
+
+    # 1) Whole-response-is-JSON fast path.
     try:
         data = json.loads(text)
+        if isinstance(data, dict) and "ideas" in data:
+            return _normalize_ideas(data["ideas"])
     except json.JSONDecodeError:
+        pass
+
+    # 2) Walk every `{` candidate; return the first balanced block that parses
+    #    as a dict with an "ideas" key.
+    for block in _iter_json_objects(text):
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and "ideas" in data:
+            return _normalize_ideas(data["ideas"])
+
+    return []
+
+
+def _normalize_ideas(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
         return []
-    items = data.get("ideas", [])
     out: list[dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
@@ -144,6 +172,51 @@ def _parse_ideas(raw: str) -> list[dict[str, Any]]:
         it.setdefault("tags", [])
         out.append(it)
     return out
+
+
+def _iter_json_objects(text: str):
+    """Yield every balanced {...} substring at top level, in order.
+
+    Honors string-literal escaping so braces inside strings don't break
+    depth tracking. Good enough for well-formed LLM JSON; not a full parser.
+    """
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        start = i
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if escape:
+                escape = False
+            elif in_string:
+                if ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        yield text[start:j + 1]
+                        i = j + 1
+                        break
+            j += 1
+        else:
+            # Unbalanced — no further candidates can complete past EOF.
+            return
+        if j >= n:
+            return
 
 
 def _system_prompt() -> str:
