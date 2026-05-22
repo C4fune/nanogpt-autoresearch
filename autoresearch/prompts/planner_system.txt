@@ -47,10 +47,24 @@ After reasoning, output exactly ONE JSON object with this schema:
   ]
 }
 
+CRITICAL — anchor discipline:
+
+You can SEE the full editable source code in the "Editable source code" section
+below, line-numbered. Do NOT guess substrings. For every `old` field you write:
+
+  1. Find the exact lines in the rendered source.
+  2. Copy the substring VERBATIM — including all spaces, parentheses, commas,
+     and trailing punctuation. The mutator compares with `==`, not fuzzy.
+  3. Make the substring UNIQUE in the file. If a one-liner appears twice,
+     extend the `old` to include the line above OR below until it's the only
+     match. The mutator rejects patches where `old` matches 0 or >1 times.
+  4. For multi-line edits, use the multi-line form with `\n` line separators
+     matching what's in the source.
+
 Hard constraints — the mutator rejects violations before any GPU runs:
 - Editable files: `train_gpt.py`, `triton_kernels.py` only.
 - Edits are search-replace OR `kind: insert_after`. Each `old` MUST match
-  EXACTLY ONCE in the file. If you're not sure, your patch will be rejected.
+  EXACTLY ONCE in the file. The source is visible to you — use it.
 - NEVER touch the data pipeline: `distributed_data_generator`, `_load_data_shard`,
   `_BIN_MAGIC`, `class Shard`, `val_tokens: int = 10485760`, `val_files`,
   `train_files`, `fineweb_train_*.bin`, `fineweb_val_*.bin`.

@@ -28,17 +28,23 @@ class Targets:
 
 @dataclass
 class LLMBudget:
-    """Token budgets keep the prompt size constant regardless of run count."""
-    total_chars: int = 80_000
+    """Token budgets keep the prompt size constant regardless of run count.
+
+    Opus-4-7 (1M context) means we can fit the full editable source plus all
+    the structural memory. Total bumped to 300K so the planner can see every
+    line of train_gpt.py / triton_kernels.py and stop hallucinating anchors.
+    """
+    total_chars: int = 300_000
     rules_chars: int = 1_500
     state_chars: int = 600
     lessons_chars: int = 3_000
     code_map_chars: int = 2_000
     summaries_chars: int = 8_000      # last ~10 run summaries
-    # Bumped: rich record cards (with descriptions + contributors) are 200-400
-    # chars each, and we want the planner to see ~20 most-recent records so it
-    # can trace the SOTA arc and propose non-obvious next moves.
+    # Rich record cards (with descriptions + contributors) — top-20 records.
     record_index_chars: int = 10_000
+    # Editable source: train_gpt.py (~90KB) + triton_kernels.py (~35KB)
+    # plus line-number prefix overhead. Inject only on planner calls.
+    source_chars: int = 180_000
     code_excerpt_chars: int = 8_000   # on-demand source slice
     # Long-horizon memory blocks (sourced from run_db / pending_wins):
     wins_chain_chars: int = 2_500     # advanced wins, in chain order

@@ -49,7 +49,12 @@ class HotContext:
     sections: tuple[str, ...]
 
 
-def build(config: Config, *, run_db: RunDB | None = None) -> HotContext:
+def build(
+    config: Config,
+    *,
+    run_db: RunDB | None = None,
+    include_source: bool = False,
+) -> HotContext:
     paths = config.paths
     budget = config.llm
     parts: list[str] = []
@@ -81,6 +86,12 @@ def build(config: Config, *, run_db: RunDB | None = None) -> HotContext:
     add("Recent run summaries (last 10)", _recent_summaries(paths, n=10), budget.summaries_chars)
     add("World records (latest first — STUDY this for SOTA evolution)",
         _record_cards(paths, k=20), budget.record_index_chars)
+    # Editable source. Only for the planner — distill/compactor don't need
+    # 100KB of source in every call. The planner uses this to choose
+    # `old` substrings that ACTUALLY EXIST in the file.
+    if include_source:
+        add("Editable source code (line-numbered; copy `old` substrings VERBATIM from here)",
+            _source_code(config), budget.source_chars)
     add("Backlog (pending)", _backlog_preview(paths, k=8), 1500)
 
     text = "\n".join(parts)
@@ -242,6 +253,25 @@ def _failure_signatures(run_db: RunDB | None) -> str:
     if not sigs:
         return "(no recent crashes — proceed normally)"
     return "\n".join(f"- ×{count:<3} {sig}" for sig, count in sigs.items())
+
+
+def _source_code(config: Config) -> str:
+    """Render every editable file with line numbers so the planner can quote
+    exact substrings as `old`. Without this section the planner is blind —
+    it hallucinates anchors and every iteration ends in `patch_rejected`.
+    """
+    parts: list[str] = []
+    for rel in config.editable_files:
+        path = config.repo_root / rel
+        if not path.exists():
+            continue
+        text = path.read_text(errors="replace")
+        lines = text.splitlines()
+        parts.append(f"=== {rel} ({len(lines)} lines, {len(text)} chars) ===")
+        for i, ln in enumerate(lines, 1):
+            parts.append(f"{i:5d}| {ln}")
+        parts.append("")
+    return "\n".join(parts)
 
 
 def _safe_read(path: Path, fallback: str = "") -> str:

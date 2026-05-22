@@ -72,7 +72,7 @@ def refill_backlog_if_needed(
         return 0
 
     system = _system_prompt()
-    ctx = build_context(config, run_db=run_db)
+    ctx = build_context(config, run_db=run_db, include_source=True)
     user = PLANNER_USER_TEMPLATE.format(context=ctx.text, n=batch_size)
 
     raw = llm.complete(system, user)
