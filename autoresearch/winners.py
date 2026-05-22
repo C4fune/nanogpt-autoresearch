@@ -416,12 +416,20 @@ def _try_push_branch(repo_root: Path, branch: str) -> bool:
 
 
 def _run_git(cwd: Path, args: list[str]) -> str:
+    # Force non-interactive git. Without this, `git push` blocks the entire
+    # daemon waiting for "Username for 'https://github.com':" when no creds
+    # are configured. We want push to FAIL fast and surface in logs, not hang.
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_ASKPASS", "/bin/true")
     proc = subprocess.run(
         ["git"] + args,
         cwd=cwd,
         check=False,
         capture_output=True,
         text=True,
+        env=env,
+        timeout=120,
     )
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(
