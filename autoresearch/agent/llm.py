@@ -103,7 +103,12 @@ class AnthropicClient:
         else:
             kwargs["temperature"] = self.temperature
 
-        resp = client.messages.create(**kwargs)
+        # Anthropic SDK refuses .create() when max_tokens implies a possibly
+        # >10-min request. With 64K max_tokens + adaptive thinking, opus-4-7
+        # can legitimately reason for that long. Use streaming and pull the
+        # final aggregated Message; same response shape, no 10-min wall.
+        with client.messages.stream(**kwargs) as stream:
+            resp = stream.get_final_message()
 
         # Split content into thinking + text. Thinking is the model's reasoning;
         # text is the actual response payload (JSON ideas, distillation, etc.).
