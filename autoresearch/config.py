@@ -62,7 +62,10 @@ class Config:
     llm: LLMBudget = field(default_factory=LLMBudget)
 
     editable_files: tuple[str, ...] = ("train_gpt.py", "triton_kernels.py")
-    run_command: tuple[str, ...] = ("./run.sh",)
+    # Explicitly invoke bash. The upstream run.sh has no #!/usr/bin/env bash
+    # shebang, so direct execve gives Errno 8 (Exec format error). The
+    # measure_baseline.sh path worked because it's wrapped by `bash`.
+    run_command: tuple[str, ...] = ("bash", "./run.sh")
     # README warns torch.compile alone is ~7 min on a cold inductor cache.
     # Pad generously: a first-ever run on a fresh box is ~10 min compile +
     # ~1.5 min train + warmup; pathological compile blowups need headroom.
